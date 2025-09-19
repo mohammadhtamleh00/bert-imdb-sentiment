@@ -1,0 +1,126 @@
+# Install required libraries (quiet mode to reduce logs)
+!pip install transformers datasets wandb --quiet
+
+# Import libraries
+import kagglehub
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
+from transformers import (
+    BertTokenizer,
+    BertForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    EarlyStoppingCallback,
+    TextClassificationPipeline
+)
+
+# -------------------------------------------------------------------------
+# 1. Download IMDB dataset from Kaggle and load it
+# -------------------------------------------------------------------------
+path = kagglehub.dataset_download("lakshmi25npathi/imdb-dataset-of-50k-movie-reviews")
+print("Path to dataset files:", path)
+
+df = pd.read_csv("/kaggle/input/imdb-dataset-of-50k-movie-reviews/IMDB Dataset.csv")
+
+# Optional: sample a smaller subset for faster training
+df = df.sample(2000, random_state=42)
+
+# Map labels: positive -> 1, negative -> 0
+df['label'] = df['sentiment'].map({'positive': 1, 'negative': 0})
+
+# Split into train and validation sets
+train_texts, val_texts, train_labels, val_labels = train_test_split(
+    df['review'].tolist(),
+    df['label'].tolist(),
+    test_size=0.2,
+    random_state=42
+)
+
+# -------------------------------------------------------------------------
+# 2. Tokenization with BERT tokenizer
+# -------------------------------------------------------------------------
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+
+train_encodings = tokenizer(train_texts, truncation=True, padding=True, max_length=128)
+val_encodings = tokenizer(val_texts, truncation=True, padding=True, max_length=128)
+
+# -------------------------------------------------------------------------
+# 3. Create a custom PyTorch Dataset
+# -------------------------------------------------------------------------
+class IMDbDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        # Return dictionary of tensors for each input sample
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels[idx])
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
+train_dataset = IMDbDataset(train_encodings, train_labels)
+val_dataset = IMDbDataset(val_encodings, val_labels)
+
+# -------------------------------------------------------------------------
+# 4. Load pre-trained BERT model for sequence classification
+# -------------------------------------------------------------------------
+model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
+
+# -------------------------------------------------------------------------
+# 5. Define training arguments and Trainer
+# -------------------------------------------------------------------------
+training_args = TrainingArguments(
+    output_dir="./results",              # Save model outputs here
+    num_train_epochs=3,                  # Training epochs
+    per_device_train_batch_size=8,       # Training batch size
+    per_device_eval_batch_size=16,       # Validation batch size
+    warmup_steps=10,                     # Warm-up steps for learning rate scheduler
+    eval_strategy="epoch",               # Run evaluation at end of each epoch
+    save_strategy="epoch",               # Save checkpoint each epoch
+    logging_steps=10,                    # Log every 10 steps
+    learning_rate=2e-5,                  # Learning rate
+    weight_decay=0.01,                   # Weight decay
+    report_to="none",                    # Disable W&B reporting
+    run_name="bert-imdb-small",          # Experiment name
+    load_best_model_at_end=True,         # Load best model automatically
+    metric_for_best_model="eval_loss",   # Use evaluation loss for early stopping
+    greater_is_better=False,             # Lower loss = better
+)
+
+# Initialize Trainer with early stopping
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
+)
+
+# -------------------------------------------------------------------------
+# 6. Train the model
+# -------------------------------------------------------------------------
+trainer.train()
+
+# -------------------------------------------------------------------------
+# 7. Save model and tokenizer
+# -------------------------------------------------------------------------
+model.save_pretrained("movie-review-classifier")
+tokenizer.save_pretrained("movie-review-classifier")
+
+# -------------------------------------------------------------------------
+# 8. Inference with pipeline
+# -------------------------------------------------------------------------
+pipeline = TextClassificationPipeline(
+    model=model,
+    tokenizer=tokenizer,
+    return_all_scores=False,
+    device=0 if torch.cuda.is_available() else -1
+)
+
+# Test the model with a sample review
+result = pipeline("This movie was amazing and full of emotions!")
+print(result)  # Example output: [{'label': 'LABEL_1', 'score': 0.98}]
